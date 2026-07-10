@@ -1,33 +1,31 @@
-# GitHub Actions Worker BotAPI Transcoder V3 - 20 Bots
+# GitHub Actions Worker BotAPI Transcoder V4 Live Upload
 
-## New features
+## Features
 
+- Live upload while FFmpeg is still generating segments
+- Deletes local segment files after upload
+- 20 bots support: `BOT_TOKEN_1..20`
 - Multiple workers via `WORKER_BASE_URLS`
-- Multiple bots via `BOT_TOKEN_1..20`
-- Smart segment retry: default `12,8,5` seconds
-- Hard file size limit: default `17MB`
-- Parallel Bot API uploads
-- Summary message to `LOG_CHANNEL_ID`
+- Smart retry: `12,8,5` seconds
+- Hard limit default: `17MB`
+- Failed size attempt deletes already-uploaded Telegram messages
+- Log channel summary
+- Force worker index for testing custom domain
 
 ## Required GitHub Secrets
 
 ```text
 BOT_TOKEN_1=...
-BOT_TOKEN_2=... optional
 ...
 BOT_TOKEN_20=... optional
 CHAT_ID=-100storage_channel
 LOG_CHANNEL_ID=-100log_channel
-WORKER_BASE_URLS=https://v2.7homelander.workers.dev,https://uv.v2homelander.workers.dev,https://top.v3deep.workers.dev,https://the.v4god.workers.dev,https://night.v5night.workers.dev
+WORKER_BASE_URLS=https://v1homelander.dpdns.org,https://uv.v2homelander.workers.dev,https://top.v3deep.workers.dev,https://the.v4god.workers.dev,https://night.v5night.workers.dev
 MONGO_URI=...
 PUBLIC_WATCH_BASE_URL=https://v1homelander-8naz.onrender.com
 ```
 
-## Run workflow
-
-Actions -> Worker BotAPI Transcoder V2 Smart -> Run workflow.
-
-Recommended:
+## Recommended Run Inputs
 
 ```text
 segment_times=12,8,5
@@ -35,21 +33,13 @@ hard_limit_mb=17
 video_mode=copy
 audio_mode=aac
 max_parallel_uploads=12
+force_worker_index=0
 ```
 
+## Force custom domain worker test
 
-## 20 bots note
-
-Cloudflare Workers me bhi same `BOT_TOKEN_1..BOT_TOKEN_20` same order me hone chahiye.
-
-Recommended first run:
+If `WORKER_BASE_URLS` first URL is custom domain, run with:
 
 ```text
-max_parallel_uploads=12
-```
-
-Agar 429/FloodWait na aaye aur speed badhani ho, tab:
-
-```text
-max_parallel_uploads=16 ya 20
+force_worker_index=1
 ```
