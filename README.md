@@ -1,54 +1,36 @@
-# GitHub Actions Worker BotAPI Transcoder V1
+# GitHub Actions Worker BotAPI Transcoder V2 Smart
 
-## Setup
+## New features
 
-1. GitHub repo banao.
-2. Is folder ka content repo me push karo.
-3. Repo Settings -> Secrets and variables -> Actions -> New repository secret.
+- Multiple workers via `WORKER_BASE_URLS`
+- Multiple bots via `BOT_TOKEN_1..10`
+- Smart segment retry: default `12,8,5` seconds
+- Hard file size limit: default `17MB`
+- Parallel Bot API uploads
+- Summary message to `LOG_CHANNEL_ID`
 
-Required secrets:
+## Required GitHub Secrets
 
 ```text
-BOT_TOKEN_1 = same token as Cloudflare Worker BOT_TOKEN_1
-CHAT_ID = -100your_channel_id
-WORKER_BASE_URL = https://hv.rangxdark.workers.dev
-MONGO_URI = your mongodb uri
+BOT_TOKEN_1=...
+BOT_TOKEN_2=... optional
+CHAT_ID=-100storage_channel
+LOG_CHANNEL_ID=-100log_channel
+WORKER_BASE_URLS=https://v2.7homelander.workers.dev,https://uv.v2homelander.workers.dev,https://top.v3deep.workers.dev,https://the.v4god.workers.dev,https://night.v5night.workers.dev
+MONGO_URI=...
+PUBLIC_WATCH_BASE_URL=https://v1homelander-8naz.onrender.com
 ```
 
-Optional multiple bots:
+## Run workflow
+
+Actions -> Worker BotAPI Transcoder V2 Smart -> Run workflow.
+
+Recommended:
 
 ```text
-BOT_TOKEN_2 ... BOT_TOKEN_10
-```
-
-## Run
-
-GitHub repo -> Actions -> Worker BotAPI Transcoder -> Run workflow.
-
-Inputs:
-
-```text
-video_url
-_title
-segment_time = 10
-video_mode = copy or encode
-audio_mode = aac or copy
-```
-
-Recommended first test:
-
-```text
+segment_times=12,8,5
+hard_limit_mb=17
 video_mode=copy
 audio_mode=aac
-segment_time=10
+max_parallel_uploads=8
 ```
-
-## Output
-
-- MongoDB me movie save hoga.
-- Artifacts me metadata.json and worker_playlist.m3u8 milega.
-- Watch URL: your streamer /watch/{movie_id}
-
-## Important
-
-Har init/segment file <=20MB honi chahiye. Agar fail ho, segment_time kam karo ya bitrate/encode mode use karo.
