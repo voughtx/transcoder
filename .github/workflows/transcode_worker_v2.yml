@@ -1,0 +1,107 @@
+name: Worker BotAPI Transcoder V2 Smart
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: "Video URL / Google Drive URL / direct URL"
+        required: true
+        type: string
+      title:
+        description: "Movie title"
+        required: true
+        type: string
+      segment_times:
+        description: "Smart segment retry list, seconds"
+        required: false
+        default: "12,8,5"
+        type: string
+      hard_limit_mb:
+        description: "Max allowed segment size MB"
+        required: false
+        default: "17"
+        type: string
+      video_mode:
+        description: "copy or encode"
+        required: false
+        default: "copy"
+        type: choice
+        options:
+          - copy
+          - encode
+      audio_mode:
+        description: "aac or copy"
+        required: false
+        default: "aac"
+        type: choice
+        options:
+          - aac
+          - copy
+      max_parallel_uploads:
+        description: "Parallel Bot API uploads"
+        required: false
+        default: "8"
+        type: string
+
+jobs:
+  transcode:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          ffmpeg -version
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run smart transcoder uploader
+        env:
+          VIDEO_URL: ${{ inputs.video_url }}
+          TITLE: ${{ inputs.title }}
+          SEGMENT_TIMES: ${{ inputs.segment_times }}
+          HARD_LIMIT_MB: ${{ inputs.hard_limit_mb }}
+          VIDEO_MODE: ${{ inputs.video_mode }}
+          AUDIO_MODE: ${{ inputs.audio_mode }}
+          MAX_PARALLEL_UPLOADS: ${{ inputs.max_parallel_uploads }}
+          WORKER_BASE_URLS: ${{ secrets.WORKER_BASE_URLS }}
+          PUBLIC_WATCH_BASE_URL: ${{ secrets.PUBLIC_WATCH_BASE_URL }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+          LOG_CHANNEL_ID: ${{ secrets.LOG_CHANNEL_ID }}
+          MONGO_URI: ${{ secrets.MONGO_URI }}
+          BOT_TOKEN_1: ${{ secrets.BOT_TOKEN_1 }}
+          BOT_TOKEN_2: ${{ secrets.BOT_TOKEN_2 }}
+          BOT_TOKEN_3: ${{ secrets.BOT_TOKEN_3 }}
+          BOT_TOKEN_4: ${{ secrets.BOT_TOKEN_4 }}
+          BOT_TOKEN_5: ${{ secrets.BOT_TOKEN_5 }}
+          BOT_TOKEN_6: ${{ secrets.BOT_TOKEN_6 }}
+          BOT_TOKEN_7: ${{ secrets.BOT_TOKEN_7 }}
+          BOT_TOKEN_8: ${{ secrets.BOT_TOKEN_8 }}
+          BOT_TOKEN_9: ${{ secrets.BOT_TOKEN_9 }}
+          BOT_TOKEN_10: ${{ secrets.BOT_TOKEN_10 }}
+        run: |
+          python scripts/transcode_upload_worker_v2.py
+
+      - name: Upload metadata artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: transcoder-output-v2
+          path: |
+            output/metadata.json
+            output/worker_playlist.m3u8
+            output/run_summary.txt
+          if-no-files-found: ignore
