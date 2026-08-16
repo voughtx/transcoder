@@ -1,289 +1,73 @@
-name: R2-SAC Sync Prewarm / Verify / Keep-Alive
+name: Segment Prewarm (manifest, no-secret)
 
-# Manual trigger only. This workflow does NOT run on push/commit.
 on:
   workflow_dispatch:
     inputs:
       movie_id:
-        description: "Movie ID to process, e.g. 83716"
+        description: "Movie ID"
         required: true
         type: string
-      render_base_url:
-        description: "Render base URL"
-        required: false
-        default: "https://v1homelander-8naz.onrender.com"
-        type: string
-      cdn_base_url:
-        description: "CDN base URL"
-        required: false
-        default: "https://homeleni.dpdns.org"
-        type: string
-      worker_base_url:
-        description: "Worker fallback base URL"
-        required: false
-        default: "https://v2.7homelander.workers.dev"
-        type: string
-      limit:
-        description: "Limit number of playlist objects; 0 = all"
-        required: false
-        default: "0"
-        type: string
-      wait_after_worker:
-        description: "Optional seconds to wait after sync prewarm before CDN recheck; normally 0"
-        required: false
-        default: "0"
-        type: string
-      mode:
-        description: "prewarm = sync worker warm on miss, verify-only = check only, keepalive = touch CDN only"
-        required: false
-        default: "prewarm"
-        type: choice
-        options:
-          - prewarm
-          - verify-only
-          - keepalive
-
-permissions:
-  contents: read
-
-concurrency:
-  group: r2-sac-${{ github.event.inputs.mode }}-${{ github.event.inputs.movie_id }}
-  cancel-in-progress: false
 
 jobs:
   prewarm:
-    name: R2-SAC ${{ github.event.inputs.mode }} for ${{ github.event.inputs.movie_id }}
+    name: Prewarm movie
     runs-on: ubuntu-latest
-    timeout-minutes: 180
-
+    timeout-minutes: 120
     steps:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
-      - name: Install Python dependencies
+      - name: Install requests
         run: python -m pip install --upgrade requests
-
-      - name: Run R2-SAC sync prewarm / verify / keepalive
+      - name: Run prewarm (no-secret)
         env:
           MOVIE_ID: ${{ github.event.inputs.movie_id }}
-          RENDER_BASE_URL: ${{ github.event.inputs.render_base_url }}
-          CDN_BASE_URL: ${{ github.event.inputs.cdn_base_url }}
-          WORKER_BASE_URL: ${{ github.event.inputs.worker_base_url }}
-          LIMIT: ${{ github.event.inputs.limit }}
-          WAIT_AFTER_WORKER: ${{ github.event.inputs.wait_after_worker }}
-          MODE: ${{ github.event.inputs.mode }}
-          PREWARM_SECRET: ${{ secrets.PREWARM_SECRET }}
+          HL_CFG: ${{ secrets.HL_CFG }}
         run: |
-          cat > prewarm_r2_sac_sync.py <<'PY'
-          import os
-          import re
-          import time
-          import json
-          import sys
-          from collections import Counter
-
+          cat > _pw.py <<'PY'
+          import os, re, json, time, sys, base64
           import requests
 
-          MOVIE_ID = os.environ["MOVIE_ID"].strip()
-          RENDER_BASE = os.environ.get("RENDER_BASE_URL", "").strip().rstrip("/")
-          CDN_BASE = os.environ.get("CDN_BASE_URL", "").strip().rstrip("/")
-          WORKER_BASE = os.environ.get("WORKER_BASE_URL", "").strip().rstrip("/")
-          LIMIT = int(os.environ.get("LIMIT", "0") or "0")
-          WAIT_AFTER_WORKER = float(os.environ.get("WAIT_AFTER_WORKER", "0") or "0")
-          MODE = os.environ.get("MODE", "prewarm").strip()
-          PREWARM_SECRET = os.environ.get("PREWARM_SECRET", "").strip()
+          MID = os.environ["MOVIE_ID"].strip()
+          VERBOSE = os.environ.get("VERBOSE_LOGS", "").lower() in ("1", "true", "yes")
+          _cfg = json.loads(base64.b64decode(os.environ.get("HL_CFG", "").encode()).decode())
+          CDN = _cfg["cdn_base"]
+          REF = _cfg["pages"] + "/"
+          UA = "Mozilla/5.0 (Homelander-Prewarm)"
 
-          if MODE not in {"prewarm", "verify-only", "keepalive"}:
-              raise SystemExit(f"Invalid MODE: {MODE}")
-          if not MOVIE_ID:
-              raise SystemExit("movie_id missing")
-          if not RENDER_BASE or not CDN_BASE or not WORKER_BASE:
-              raise SystemExit("render_base_url / cdn_base_url / worker_base_url required")
-          if MODE == "prewarm" and not PREWARM_SECRET:
-              raise SystemExit("PREWARM_SECRET GitHub secret missing")
+          def g(url, headers=None, timeout=90):
+              h = {"Referer": REF, "User-Agent": UA}
+              if headers: h.update(headers)
+              return requests.get(url, headers=h, timeout=timeout)
 
-          PLAYLIST = f"{RENDER_BASE}/playlist/{MOVIE_ID}.m3u8"
-          RETRYABLE = {0, 401, 403, 404, 408, 429, 500, 502, 503, 504}
+          m = g(f"{CDN}/manifests/{MID}.json?_pw={int(time.time())}", timeout=30)
+          m.raise_for_status()
+          mf = m.json()
+          fa = mf.get("fallback_auth") or {}
+          worker = (mf.get("workers") or [_cfg.get("worker_base")])[0]
+          pl = g(mf["playlist_url"], timeout=30); pl.raise_for_status()
+          segs = [l.strip() for l in pl.text.splitlines() if l.startswith("http") and "/segments/" in l]
+          print(f"PREWARM | movie {MID if VERBOSE else MID[:4]+chr(8230)} | segments {len(segs)}")
 
-          def get_with_retries(url, *, headers=None, timeout=45, attempts=3):
-              last = None
-              for attempt in range(1, attempts + 1):
-                  try:
-                      return requests.get(url, headers=headers or {}, timeout=timeout)
-                  except Exception as e:
-                      last = e
-                      print(f"retry {attempt}/{attempts} error for {url[:120]}: {repr(e)}")
-                      time.sleep(2 * attempt)
-              raise last
-
-          def parse_playlist(text):
-              urls = []
-              for line in text.splitlines():
-                  line = line.strip()
-                  if line.startswith("#EXT-X-MAP"):
-                      m = re.search(r'URI="([^"]+)"', line)
-                      if m:
-                          urls.append(("init", m.group(1)))
-                  elif line.startswith("http"):
-                      urls.append(("seg", line))
-              return urls
-
-          def to_prewarm_url(cdn_url):
-              return cdn_url.replace(CDN_BASE + "/segments/", WORKER_BASE + "/prewarm/")
-
-          print("R2-SAC sync job")
-          print("movie_id:", MOVIE_ID)
-          print("mode:", MODE)
-          print("playlist:", PLAYLIST)
-          print("cdn_base:", CDN_BASE)
-          print("worker_base:", WORKER_BASE)
-          print("limit:", LIMIT)
-          print("wait_after_worker:", WAIT_AFTER_WORKER)
-
-          playlist_resp = get_with_retries(PLAYLIST, timeout=45)
-          print(
-              "playlist status:", playlist_resp.status_code,
-              "bytes:", len(playlist_resp.content),
-              "content-type:", playlist_resp.headers.get("Content-Type"),
-          )
-          playlist_resp.raise_for_status()
-
-          urls = parse_playlist(playlist_resp.text)
-          if LIMIT > 0:
-              urls = urls[:LIMIT]
-          print("total urls:", len(urls))
-          if not urls:
-              raise SystemExit("No segment URLs found in playlist")
-
-          summary = Counter()
-          before_summary = Counter()
-          worker_populated = 0
-          sync_ok = 0
-          sync_failed = 0
-          errors = 0
-          bad_after = 0
-
-          range_headers = {"Range": "bytes=0-1023", "Connection": "close"}
-
-          for i, (typ, cdn_url) in enumerate(urls):
-              print(f"\n--- {i} {typ} ---")
+          warm = cold = fail = 0
+          for i, s in enumerate(segs):
               try:
-                  first = get_with_retries(cdn_url, headers=range_headers, timeout=45)
-                  first_cf = first.headers.get("CF-Cache-Status")
-                  before_key = f"{first.status_code}_{first_cf}"
-                  before_summary[before_key] += 1
-                  print(
-                      "CDN first:", first.status_code, first_cf,
-                      "age:", first.headers.get("Age"),
-                      "bytes:", len(first.content),
-                      "range:", first.headers.get("Content-Range"),
-                  )
-
-                  if MODE in {"verify-only", "keepalive"}:
-                      summary[before_key] += 1
-                      if MODE == "verify-only" and first.status_code != 206:
-                          bad_after += 1
-                      time.sleep(0.15)
-                      continue
-
-                  # MODE == prewarm
-                  if first.status_code == 206:
-                      summary[before_key] += 1
-                      time.sleep(0.2)
-                      continue
-
-                  if first.status_code in RETRYABLE:
-                      prewarm_url = to_prewarm_url(cdn_url)
-                      print("Worker sync prewarm:", prewarm_url[:180])
-                      sync_resp = get_with_retries(
-                          prewarm_url,
-                          headers={
-                              "Connection": "close",
-                              "X-Prewarm-Secret": PREWARM_SECRET,
-                          },
-                          timeout=300,
-                          attempts=2,
-                      )
-                      print("Sync prewarm status:", sync_resp.status_code, "bytes:", len(sync_resp.content))
-                      try:
-                          payload = sync_resp.json()
-                          print("Sync prewarm JSON:", json.dumps(payload, indent=2)[:1200])
-                      except Exception:
-                          payload = {"ok": False, "raw": sync_resp.text[:500]}
-                          print("Sync prewarm raw:", sync_resp.text[:500])
-
-                      if sync_resp.status_code == 200 and payload.get("ok"):
-                          worker_populated += 1
-                          sync_ok += 1
-                      else:
-                          sync_failed += 1
-
-                      if WAIT_AFTER_WORKER > 0:
-                          print(f"Optional wait {WAIT_AFTER_WORKER}s before CDN recheck...")
-                          time.sleep(WAIT_AFTER_WORKER)
-
-                  after = get_with_retries(cdn_url, headers=range_headers, timeout=45)
-                  after_key = f"{after.status_code}_{after.headers.get('CF-Cache-Status')}"
-                  summary[after_key] += 1
-                  print(
-                      "CDN after:", after.status_code,
-                      after.headers.get("CF-Cache-Status"),
-                      "age:", after.headers.get("Age"),
-                      "bytes:", len(after.content),
-                      "range:", after.headers.get("Content-Range"),
-                  )
-                  if after.status_code != 206:
-                      bad_after += 1
-
-              except Exception as e:
-                  errors += 1
-                  summary["ERROR"] += 1
-                  print("ERROR:", repr(e))
-
-              time.sleep(0.25)
-
-          print("\nDONE")
-          print("BEFORE_SUMMARY:", dict(before_summary))
-          print("SUMMARY:", dict(summary))
-          print("Worker populated:", worker_populated)
-          print("Sync OK:", sync_ok)
-          print("Sync failed:", sync_failed)
-          print("Errors:", errors)
-          print("Bad after:", bad_after)
-
-          md = []
-          md.append("# R2-SAC Sync Prewarm Summary")
-          md.append("")
-          md.append(f"- Movie ID: `{MOVIE_ID}`")
-          md.append(f"- Mode: `{MODE}`")
-          md.append(f"- Total objects: `{len(urls)}`")
-          md.append(f"- Worker populated: `{worker_populated}`")
-          md.append(f"- Sync OK: `{sync_ok}`")
-          md.append(f"- Sync failed: `{sync_failed}`")
-          md.append(f"- Errors: `{errors}`")
-          md.append(f"- Bad after: `{bad_after}`")
-          md.append("")
-          md.append("## Before summary")
-          md.append("```json")
-          md.append(json.dumps(dict(before_summary), indent=2))
-          md.append("```")
-          md.append("## Final summary")
-          md.append("```json")
-          md.append(json.dumps(dict(summary), indent=2))
-          md.append("```")
-
-          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
-          if summary_path:
-              with open(summary_path, "a", encoding="utf-8") as f:
-                  f.write("\n".join(md) + "\n")
-
-          if MODE in {"prewarm", "verify-only"}:
-              if errors or bad_after or sync_failed:
-                  sys.exit(1)
-
-          # keepalive does not fail just because some objects are MISS/404.
+                  r = g(s, headers={"Range": "bytes=0-0"}, timeout=30)
+                  if r.status_code in (200, 206):
+                      warm += 1; continue
+                  obj = s.split("/segments/")[-1]
+                  pr = g(f"{worker}/prepare/{obj}?mid={fa.get('movie_id')}&exp={fa.get('exp')}&sig={fa.get('sig')}", timeout=120)
+                  if pr.status_code == 200:
+                      r2 = g(s, headers={"Range": "bytes=0-1023"}, timeout=30)
+                      if r2.status_code in (200, 206): warm += 1
+                      else: cold += 1
+                  else:
+                      fail += 1
+              except Exception:
+                  fail += 1
+              if (i+1) % 20 == 0:
+                  print(f"  progress {i+1}/{len(segs)} | warm {warm} cold {cold} fail {fail}")
+          print(f"PREWARM DONE | warm={warm} cold={cold} fail={fail}")
           PY
-
-          python prewarm_r2_sac_sync.py
+          python -u _pw.py
