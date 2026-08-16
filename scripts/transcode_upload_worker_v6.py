@@ -196,19 +196,6 @@ def upload_file(token: str, bot_idx: str, worker_base: str, chat_id: str, path: 
     worker_url = f"{worker_base.rstrip('/')}/tg/{bot_idx}/{b64url(file_id)}.{ext}"
     return {"bot": bot_idx, "file_id": file_id, "ext": ext, "worker_url": worker_url, "s": size}
 
-def build_worker_playlist(original: str, init_url: Optional[str], seg_urls: List[str]) -> str:
-    lines = []
-    it = iter(seg_urls)
-    for line in original.splitlines():
-        st = line.strip()
-        if st.startswith("#EXT-X-MAP:") and init_url:
-            lines.append(f'#EXT-X-MAP:URI="{init_url}"')
-        elif st and not st.startswith("#"):
-            lines.append(next(it, line))
-        else:
-            lines.append(line)
-    return "\n".join(lines) + "\n"
-
 def send_log_message(token: str, chat_id: str, text: str):
     try:
         requests.post(f"https://api.telegram.org/bot{token}/sendMessage", data={"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": "true"}, timeout=30)
@@ -220,6 +207,40 @@ def cleanup_uploaded(uploaded: List[Dict], tokens: List[str], chat_id: str):
         bot_i = int(str(meta.get("bot", "bot1")).replace("bot", "")) - 1
         if 0 <= bot_i < len(tokens):
             delete_message(tokens[bot_i], chat_id, meta.get("file_id", ""))
+
+def merge_groups(entries, out_dir, hard_bytes, max_dur=90.0):
+    groups = []
+    cur = []
+    cur_dur = 0.0
+    cur_size = 0
+    for ent in entries:
+        path = out_dir / Path(ent["uri"]).name
+        sz = path.stat().st_size
+        d = float(ent["duration"])
+        if cur and (cur_size + sz > hard_bytes * 0.9 or cur_dur + d > max_dur):
+            groups.append(cur)
+            cur = []
+            cur_dur = 0.0
+            cur_size = 0
+        cur.append((path, d))
+        cur_dur += d
+        cur_size += sz
+    if cur:
+        groups.append(cur)
+    return groups
+
+
+def build_merged_playlist(init_url, segments):
+    target = max(1, math.ceil(max(s["d"] for s in segments)))
+    L = ["#EXTM3U", "#EXT-X-VERSION:7", f"#EXT-X-TARGETDURATION:{target}",
+         "#EXT-X-MEDIA-SEQUENCE:0", "#EXT-X-PLAYLIST-TYPE:VOD",
+         "#EXT-X-INDEPENDENT-SEGMENTS", f'#EXT-X-MAP:URI="{init_url}"', ""]
+    for s in segments:
+        L.append(f"#EXTINF:{s['d']:.3f},")
+        L.append(s["worker_url"])
+    L.append("#EXT-X-ENDLIST")
+    return "\n".join(L) + "\n"
+
 
 def attempt_live_transcode_upload(direct: str, title: str, video_url: str, seg_time: int, video_mode: str, audio_mode: str, chosen_worker: str, tokens: List[str], chat_id: str, hard_bytes: int, max_parallel: int):
     out_dir = Path("hls")
@@ -234,126 +255,84 @@ def attempt_live_transcode_upload(direct: str, title: str, video_url: str, seg_t
     cmd = build_ffmpeg_cmd(direct, out_dir, seg_time, video_mode, audio_mode)
     if VERBOSE:
         print("CMD:", " ".join(cmd))
-    proc = subprocess.Popen(cmd, stdout=logf, stderr=logf)
+    proc = subprocess.run(cmd, stdout=logf, stderr=logf)
+    if proc.returncode != 0:
+        logf.close()
+        raise RuntimeError(f"ffmpeg failed code {proc.returncode}")
+
+    init_uri, entries, original = parse_hls_current(index)
+    if not init_uri:
+        logf.close()
+        raise RuntimeError("init not produced")
+    if not entries:
+        logf.close()
+        raise RuntimeError("no segments produced")
+    print(f"ffmpeg done: {len(entries)} raw segments")
 
     uploaded_all = []
-    init_meta = None
-    uploaded_seg_by_name: Dict[str, Dict] = {}
-    futures = {}
-    executor = ThreadPoolExecutor(max_workers=max(1, min(max_parallel, len(tokens) * 2)))
-    fatal_error = None
-    init_uploaded = False
-
-    def submit_upload(seg_index: int, filename: str, duration: float):
-        path = out_dir / Path(filename).name
-        bot_i = seg_index % len(tokens)
-        bot_idx = f"bot{bot_i+1}"
-        print(f"Queue upload {seg_index+1}: {path.name} via {bot_idx} size={path.stat().st_size}")
-        return executor.submit(upload_file, tokens[bot_i], bot_idx, chosen_worker, chat_id, path, f"{title} | part {seg_index+1}", hard_bytes)
-
+    init_path = out_dir / Path(init_uri).name
+    if init_path.stat().st_size > hard_bytes:
+        logf.close()
+        raise SizeLimitError(f"init {init_path.name} too large")
+    init_meta = upload_file(tokens[0], "bot1", chosen_worker, chat_id, init_path, f"{title} | init", hard_bytes)
+    uploaded_all.append(init_meta)
     try:
-        while True:
-            init_uri, entries, _txt = parse_hls_current(index)
-            if init_uri and not init_uploaded:
-                init_path = out_dir / Path(init_uri).name
-                if init_path.exists():
-                    if init_path.stat().st_size > hard_bytes:
-                        raise SizeLimitError(f"init {init_path.name} too large")
-                    print(f"Uploading init {init_path.name}")
-                    init_meta = upload_file(tokens[0], "bot1", chosen_worker, chat_id, init_path, f"{title} | init", hard_bytes)
-                    uploaded_all.append(init_meta)
-                    init_uploaded = True
-                    try: init_path.unlink()
-                    except Exception: pass
+        init_path.unlink()
+    except Exception:
+        pass
 
-            for i, ent in enumerate(entries):
-                fname = Path(ent["uri"]).name
-                if fname in uploaded_seg_by_name or fname in futures:
-                    continue
-                path = out_dir / fname
-                if not path.exists():
-                    continue
-                size = path.stat().st_size
-                if size > hard_bytes:
-                    raise SizeLimitError(f"{fname} {size/1024/1024:.2f}MB > hard limit")
-                futures[fname] = (i, ent, submit_upload(i, fname, float(ent["duration"])))
+    for ent in entries:
+        p = out_dir / Path(ent["uri"]).name
+        if p.stat().st_size > hard_bytes:
+            logf.close()
+            raise SizeLimitError(f"{p.name} {p.stat().st_size/1048576:.2f}MB > hard limit")
 
-            for fname, (i, ent, fut) in list(futures.items()):
-                if fut.done():
-                    meta = fut.result()
-                    meta.update({"i": i, "d": float(ent["duration"])})
-                    uploaded_seg_by_name[fname] = meta
-                    uploaded_all.append(meta)
-                    del futures[fname]
-                    try:
-                        (out_dir / fname).unlink()
-                    except Exception:
-                        pass
-                    print(f"Uploaded done {i+1}: {fname}")
+    groups = merge_groups(entries, out_dir, hard_bytes)
+    print(f"merge: {len(entries)} -> {len(groups)} segments")
 
-            rc = proc.poll()
-            if rc is not None:
-                init_uri, entries, original = parse_hls_current(index)
-                for i, ent in enumerate(entries):
-                    fname = Path(ent["uri"]).name
-                    if fname in uploaded_seg_by_name or fname in futures:
-                        continue
-                    path = out_dir / fname
-                    if not path.exists():
-                        raise UploadError(f"Final segment missing: {fname}")
-                    if path.stat().st_size > hard_bytes:
-                        raise SizeLimitError(f"{fname} {path.stat().st_size/1024/1024:.2f}MB > hard limit")
-                    futures[fname] = (i, ent, submit_upload(i, fname, float(ent["duration"])))
-                break
-            time.sleep(0.35)
-
-        if proc.returncode not in (0, None):
-            raise RuntimeError(f"ffmpeg failed code {proc.returncode}; see output/ffmpeg.log")
-
-        while futures:
-            for fname, (i, ent, fut) in list(futures.items()):
-                if fut.done():
-                    meta = fut.result()
-                    meta.update({"i": i, "d": float(ent["duration"])})
-                    uploaded_seg_by_name[fname] = meta
-                    uploaded_all.append(meta)
-                    del futures[fname]
-                    try: (out_dir / fname).unlink()
-                    except Exception: pass
-                    print(f"Uploaded done {i+1}: {fname}")
-            time.sleep(0.2)
-
-        init_uri, entries, original = parse_hls_current(index)
-        if not init_meta:
-            raise RuntimeError("init.mp4 was not uploaded")
+    executor = ThreadPoolExecutor(max_workers=max(1, min(max_parallel, len(tokens) * 2)))
+    futures = {}
+    try:
+        for gi, group in enumerate(groups):
+            merged_path = out_dir / f"mseg_{gi:05d}.m4s"
+            with open(merged_path, "wb") as out:
+                for (pth, d) in group:
+                    out.write(pth.read_bytes())
+            total_dur = sum(d for (_, d) in group)
+            bot_i = gi % len(tokens)
+            bot_idx = f"bot{bot_i+1}"
+            fut = executor.submit(upload_file, tokens[bot_i], bot_idx, chosen_worker, chat_id, merged_path, f"{title} | part {gi+1}", hard_bytes)
+            futures[fut] = (gi, total_dur, merged_path)
         segments = []
-        for i, ent in enumerate(entries):
-            fname = Path(ent["uri"]).name
-            meta = uploaded_seg_by_name.get(fname)
-            if not meta:
-                raise RuntimeError(f"Segment not uploaded: {fname}")
-            meta["i"] = i
-            meta["d"] = float(ent["duration"])
+        for fut in futures:
+            try:
+                meta = fut.result()
+            except Exception:
+                raise
+            gi, total_dur, merged_path = futures[fut]
+            meta["i"] = gi
+            meta["d"] = total_dur
             segments.append(meta)
-        playlist = build_worker_playlist(original, init_meta["worker_url"], [x["worker_url"] for x in segments])
-        max_size = max([init_meta.get("s", 0)] + [x.get("s", 0) for x in segments])
-        return init_meta, segments, playlist, max_size, uploaded_all
+            uploaded_all.append(meta)
+            try:
+                merged_path.unlink()
+            except Exception:
+                pass
+        segments.sort(key=lambda x: x["i"])
     except Exception as e:
-        fatal_error = e
-        try:
-            if proc.poll() is None:
-                proc.terminate()
-                try: proc.wait(timeout=10)
-                except subprocess.TimeoutExpired: proc.kill()
-        except Exception:
-            pass
-        for _fname, (_i, _ent, fut) in futures.items():
+        for fut in futures:
             fut.cancel()
         cleanup_uploaded(uploaded_all, tokens, chat_id)
-        raise fatal_error
-    finally:
-        executor.shutdown(wait=False, cancel_futures=True)
         logf.close()
+        raise e
+    finally:
+        executor.shutdown(wait=True)
+
+    playlist = build_merged_playlist(init_meta["worker_url"], segments)
+    max_size = max([init_meta.get("s", 0)] + [x.get("s", 0) for x in segments])
+    logf.close()
+    return init_meta, segments, playlist, max_size, uploaded_all
+
 
 def main():
     start_time = time.time()
