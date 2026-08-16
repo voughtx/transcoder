@@ -1,18 +1,4 @@
-#!/usr/bin/env python3
-# Homelander Transcoder V6.2 — keyframe/bitrate-aware smart segmentation
-# v6.2 changes (vs v5 dynamic trial 12->8->5):
-#   1. ffprobe se source bitrate + duration PEHLE measure (2-3s)
-#   2. hls_time = (target_bytes * 0.85) / bitrate — single-pass smart calc
-#      (copy mode keyframes pe hi toot-ta hai, to duration~hls_time, size bounded)
-#   3. SizeLimitError sirf tab -> half time pe 1 retry (VBR spike), dobara transcode rare
-#   4. Target: 15MB default (Telegram 20MB limit se safe margin), dev jaisa long segments
-#   5. Multi-parallel upload already: 20 bots round-robin + ThreadPoolExecutor
-# ENV: VIDEO_URL, TITLE, VIDEO_MODE(copy|encode), AUDIO_MODE(aac|copy),
-#      HARD_LIMIT_MB(15), MAX_PARALLEL_UPLOADS(12), FORCE_WORKER_INDEX(0)
-# Secrets: BOT_TOKENS_JSON, WORKER_BASE_URLS, PUBLIC_WATCH_BASE_URL, CHAT_ID,
-#          LOG_CHANNEL_ID, MONGO_URI
-
-import os, re, json, time, random, base64, subprocess, mimetypes, shutil, hashlib, signal
+import os, re, json, time, random, base64, subprocess, mimetypes, shutil, hashlib
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
 from concurrent.futures import ThreadPoolExecutor
@@ -31,7 +17,6 @@ class UploadError(Exception):
 def env(name, default=""):
     return os.getenv(name, default).strip()
 
-# --- QUIET LOGS (public repo privacy): VERBOSE_LOGS=1 se full detail ---
 VERBOSE = env("VERBOSE_LOGS", "").lower() in ("1", "true", "yes")
 def mm(v):
     t = str(v)
@@ -93,7 +78,6 @@ def probe_source(url: str) -> Dict:
         data = json.loads(r.stdout)
         fmt = data.get("format", {})
         duration = float(fmt.get("duration") or 0)
-        # bit_rate = full mux bitrate (audio+video). fallback: sum stream bitrates
         bitrate = int(fmt.get("bit_rate") or 0)
         if not bitrate:
             total = 0
@@ -119,7 +103,7 @@ def probe_source(url: str) -> Dict:
 
 def compute_seg_time(probe: Dict, hard_mb: float) -> int:
     """target size se hls_time nikaalo: time = (bytes*0.85*8) / bitrate. clamp [4,60]."""
-    target_bytes = hard_mb * 1024 * 1024 * 0.85  # 15% VBR + container safety
+    target_bytes = hard_mb * 1024 * 1024 * 0.85
     bitrate = probe.get("bitrate") or 0
     if bitrate <= 0:
         return 12
@@ -401,7 +385,6 @@ def main():
     print("Chosen worker:", chosen_worker if VERBOSE else "(masked)")
     print("Bots available:", len(tokens))
 
-    # v6.2: pehle source probe -> smart hls_time -> single pass (+1 fallback)
     probe = probe_source(direct)
     print(f"probe: duration={probe['duration']:.1f}s bitrate={probe.get('bitrate')} bps video={probe['has_video']} audio={probe['has_audio']}")
     smart_time = compute_seg_time(probe, hard_mb)
@@ -463,7 +446,7 @@ def main():
         "✅ <b>Worker BotAPI Upload Complete (V6.2 smart)</b>\n\n"
         f"🎬 <b>Title:</b> {title}\n"
         f"🆔 <b>Movie ID:</b> <code>{movie_id}</code>\n"
-        f"🔗 <b>Source:</b> {"(masked)" if not VERBOSE else video_url}\n"
+        f"🔗 <b>Source:</b> " + ("(masked)" if not VERBOSE else video_url) + "\n"
         f"📦 <b>Parts:</b> {len(segments)+1}\n"
         f"⏱️ <b>Time:</b> {elapsed//60}m {elapsed%60}s\n"
         f"🎞️ <b>Mode:</b> video={video_mode}, audio={audio_mode}\n"
