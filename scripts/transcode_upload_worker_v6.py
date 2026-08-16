@@ -141,7 +141,7 @@ def select_worker(workers: List[str], video_url: str, title: str, force_index: i
     h = int(hashlib.sha256(seed.encode()).hexdigest(), 16)
     return workers[h % len(workers)]
 
-def build_ffmpeg_cmd(direct: str, out_dir: Path, seg_time: int, video_mode: str, audio_mode: str) -> List[str]:
+def build_ffmpeg_cmd(direct: str, out_dir: Path, seg_time: int, video_mode: str, audio_mode: str, encode_bitrate: int = 0) -> List[str]:
     index = out_dir / "index.m3u8"
     seg_tpl = str(out_dir / "seg_%05d.m4s")
     base = [
@@ -153,7 +153,10 @@ def build_ffmpeg_cmd(direct: str, out_dir: Path, seg_time: int, video_mode: str,
     ]
     if video_mode == "encode":
         gop = max(seg_time * 30, 60)
-        v = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p", "-g", str(gop), "-keyint_min", str(gop), "-sc_threshold", "0", "-force_key_frames", f"expr:gte(t,n_forced*{seg_time})"]
+        if encode_bitrate > 0:
+            v = ["-c:v", "libx264", "-preset", "veryfast", "-b:v", str(encode_bitrate), "-maxrate", str(encode_bitrate), "-bufsize", str(encode_bitrate * 2), "-pix_fmt", "yuv420p", "-g", str(gop), "-keyint_min", str(gop), "-sc_threshold", "0", "-force_key_frames", f"expr:gte(t,n_forced*{seg_time})"]
+        else:
+            v = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p", "-g", str(gop), "-keyint_min", str(gop), "-sc_threshold", "0", "-force_key_frames", f"expr:gte(t,n_forced*{seg_time})"]
     else:
         v = ["-c:v", "copy"]
     if audio_mode == "copy":
@@ -221,7 +224,7 @@ def cleanup_uploaded(uploaded: List[Dict], tokens: List[str], chat_id: str):
         if 0 <= bot_i < len(tokens):
             delete_message(tokens[bot_i], chat_id, meta.get("file_id", ""))
 
-def attempt_live_transcode_upload(direct: str, title: str, video_url: str, seg_time: int, video_mode: str, audio_mode: str, chosen_worker: str, tokens: List[str], chat_id: str, hard_bytes: int, max_parallel: int):
+def attempt_live_transcode_upload(direct: str, title: str, video_url: str, seg_time: int, video_mode: str, audio_mode: str, chosen_worker: str, tokens: List[str], chat_id: str, hard_bytes: int, max_parallel: int, encode_bitrate: int = 0):
     out_dir = Path("hls")
     if out_dir.exists():
         shutil.rmtree(out_dir)
@@ -231,7 +234,7 @@ def attempt_live_transcode_upload(direct: str, title: str, video_url: str, seg_t
     ffmpeg_log.parent.mkdir(exist_ok=True)
     logf = ffmpeg_log.open("w")
 
-    cmd = build_ffmpeg_cmd(direct, out_dir, seg_time, video_mode, audio_mode)
+    cmd = build_ffmpeg_cmd(direct, out_dir, seg_time, video_mode, audio_mode, encode_bitrate)
     if VERBOSE:
         print("CMD:", " ".join(cmd))
     proc = subprocess.Popen(cmd, stdout=logf, stderr=logf)
@@ -393,8 +396,9 @@ def main():
     tries = [smart_time, max(4, smart_time // 2)]
     init_meta = segments = playlist = max_size = selected_seg_time = None
     last_err = None
+    selected_video_mode = video_mode
     for st in tries:
-        print(f"\n=== attempt segment_time={st}s hard={hard_mb}MB ===")
+        print(f"\n=== attempt segment_time={st}s mode={video_mode} hard={hard_mb}MB ===")
         try:
             init_meta, segments, playlist, max_size, uploaded_all = attempt_live_transcode_upload(direct, title, video_url, st, video_mode, audio_mode, chosen_worker, tokens, chat_id, hard_bytes, max_parallel)
             selected_seg_time = st
@@ -403,6 +407,13 @@ def main():
             last_err = e
             print(f"Size limit failed for {st}s: {e}")
             continue
+    if init_meta is None:
+        enc_time = 12
+        enc_bitrate = int((hard_mb * 1024 * 1024 * 8 * 0.7) / enc_time)
+        print(f"\n=== ENCODE fallback (copy size fail) time={enc_time}s bitrate={enc_bitrate}bps ===")
+        selected_video_mode = "encode"
+        init_meta, segments, playlist, max_size, uploaded_all = attempt_live_transcode_upload(direct, title, video_url, enc_time, "encode", audio_mode, chosen_worker, tokens, chat_id, hard_bytes, max_parallel, enc_bitrate)
+        selected_seg_time = enc_time
     if init_meta is None:
         raise RuntimeError(f"All segment tries failed. Last error: {last_err}")
 
@@ -421,7 +432,7 @@ def main():
         "segment_time": selected_seg_time,
         "hard_limit_mb": hard_mb,
         "max_file_mb": round(max_size/1024/1024, 3),
-        "video_mode": video_mode,
+        "video_mode": selected_video_mode,
         "audio_mode": audio_mode,
         "source_bitrate": probe.get("bitrate") or 0,
         "init": init_meta,
