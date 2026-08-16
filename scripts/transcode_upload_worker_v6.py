@@ -141,7 +141,7 @@ def select_worker(workers: List[str], video_url: str, title: str, force_index: i
     h = int(hashlib.sha256(seed.encode()).hexdigest(), 16)
     return workers[h % len(workers)]
 
-def build_ffmpeg_cmd(direct: str, out_dir: Path, seg_time: int, video_mode: str, audio_mode: str, split_by_time: bool = False) -> List[str]:
+def build_ffmpeg_cmd(direct: str, out_dir: Path, seg_time: int, video_mode: str, audio_mode: str) -> List[str]:
     index = out_dir / "index.m3u8"
     seg_tpl = str(out_dir / "seg_%05d.m4s")
     base = [
@@ -160,11 +160,7 @@ def build_ffmpeg_cmd(direct: str, out_dir: Path, seg_time: int, video_mode: str,
         a = ["-c:a", "copy"]
     else:
         a = ["-c:a", "aac", "-b:a", "128k", "-ac", "2", "-ar", "48000", "-af", "aresample=async=1:first_pts=0"]
-    if split_by_time:
-        hls_flags = ["split_by_time"]
-    else:
-        hls_flags = ["independent_segments"]
-    hls_args = ["-f", "hls", "-hls_time", str(seg_time), "-hls_playlist_type", "vod", "-hls_segment_type", "fmp4", "-hls_fmp4_init_filename", "init.mp4", "-hls_flags", *hls_flags, "-hls_segment_filename", seg_tpl, str(index)]
+    hls_args = ["-f", "hls", "-hls_time", str(seg_time), "-hls_playlist_type", "vod", "-hls_segment_type", "fmp4", "-hls_fmp4_init_filename", "init.mp4", "-hls_flags", "independent_segments", "-hls_segment_filename", seg_tpl, str(index)]
     return base + v + a + hls_args
 
 def delete_message(token: str, chat_id: str, message_id: int):
@@ -225,7 +221,7 @@ def cleanup_uploaded(uploaded: List[Dict], tokens: List[str], chat_id: str):
         if 0 <= bot_i < len(tokens):
             delete_message(tokens[bot_i], chat_id, meta.get("file_id", ""))
 
-def attempt_live_transcode_upload(direct: str, title: str, video_url: str, seg_time: int, video_mode: str, audio_mode: str, chosen_worker: str, tokens: List[str], chat_id: str, hard_bytes: int, max_parallel: int, split_by_time: bool = False):
+def attempt_live_transcode_upload(direct: str, title: str, video_url: str, seg_time: int, video_mode: str, audio_mode: str, chosen_worker: str, tokens: List[str], chat_id: str, hard_bytes: int, max_parallel: int):
     out_dir = Path("hls")
     if out_dir.exists():
         shutil.rmtree(out_dir)
@@ -235,7 +231,7 @@ def attempt_live_transcode_upload(direct: str, title: str, video_url: str, seg_t
     ffmpeg_log.parent.mkdir(exist_ok=True)
     logf = ffmpeg_log.open("w")
 
-    cmd = build_ffmpeg_cmd(direct, out_dir, seg_time, video_mode, audio_mode, split_by_time)
+    cmd = build_ffmpeg_cmd(direct, out_dir, seg_time, video_mode, audio_mode)
     if VERBOSE:
         print("CMD:", " ".join(cmd))
     proc = subprocess.Popen(cmd, stdout=logf, stderr=logf)
@@ -395,31 +391,19 @@ def main():
     print(f"smart hls_time={smart_time}s (target {hard_mb}MB, bitrate {probe.get('bitrate')})")
 
     selected_video_mode = video_mode
-    selected_split = False
     init_meta = segments = playlist = max_size = selected_seg_time = None
     last_err = None
     for st in [smart_time, max(4, smart_time // 2)]:
-        print(f"\n=== attempt time={st}s copy(independent) hard={hard_mb}MB ===")
+        print(f"\n=== attempt time={st}s copy hard={hard_mb}MB ===")
         try:
-            init_meta, segments, playlist, max_size, uploaded_all = attempt_live_transcode_upload(direct, title, video_url, st, video_mode, audio_mode, chosen_worker, tokens, chat_id, hard_bytes, max_parallel, False)
+            init_meta, segments, playlist, max_size, uploaded_all = attempt_live_transcode_upload(direct, title, video_url, st, video_mode, audio_mode, chosen_worker, tokens, chat_id, hard_bytes, max_parallel)
             selected_seg_time = st
             break
         except SizeLimitError as e:
             last_err = e
             print(f"Size fail {st}s: {e}")
     if init_meta is None:
-        for st in [smart_time, 20, 15, 12, 10, 8, 6]:
-            print(f"\n=== attempt time={st}s copy(split_by_time) hard={hard_mb}MB ===")
-            try:
-                init_meta, segments, playlist, max_size, uploaded_all = attempt_live_transcode_upload(direct, title, video_url, st, video_mode, audio_mode, chosen_worker, tokens, chat_id, hard_bytes, max_parallel, True)
-                selected_seg_time = st
-                selected_split = True
-                break
-            except SizeLimitError as e:
-                last_err = e
-                print(f"Size fail {st}s: {e}")
-    if init_meta is None:
-        raise RuntimeError(f"All copy tries failed. Last error: {last_err}")
+        raise RuntimeError(f"Copy failed. Last error: {last_err}")
 
     movie_id = str(random.randint(10000, 99999))
     Path("output/worker_playlist.m3u8").write_text(playlist)
@@ -437,7 +421,6 @@ def main():
         "hard_limit_mb": hard_mb,
         "max_file_mb": round(max_size/1024/1024, 3),
         "video_mode": selected_video_mode,
-        "split_by_time": selected_split,
         "audio_mode": audio_mode,
         "source_bitrate": probe.get("bitrate") or 0,
         "init": init_meta,
