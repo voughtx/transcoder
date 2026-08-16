@@ -31,6 +31,12 @@ class UploadError(Exception):
 def env(name, default=""):
     return os.getenv(name, default).strip()
 
+# --- QUIET LOGS (public repo privacy): VERBOSE_LOGS=1 se full detail ---
+VERBOSE = env("VERBOSE_LOGS", "").lower() in ("1", "true", "yes")
+def mm(v):
+    t = str(v)
+    return (t[:4] + "…") if len(t) > 4 else t
+
 def b64url(text: str) -> str:
     return base64.urlsafe_b64encode(text.encode()).decode().rstrip("=")
 
@@ -61,7 +67,8 @@ def parse_tokens() -> List[str]:
     return tokens
 
 def run_capture(cmd):
-    print("CMD:", " ".join(map(str, cmd)))
+    if VERBOSE:
+        print("CMD:", " ".join(map(str, cmd)))
     return subprocess.run(cmd, text=True, capture_output=True, check=True)
 
 def get_direct_link(url: str) -> str:
@@ -241,7 +248,8 @@ def attempt_live_transcode_upload(direct: str, title: str, video_url: str, seg_t
     logf = ffmpeg_log.open("w")
 
     cmd = build_ffmpeg_cmd(direct, out_dir, seg_time, video_mode, audio_mode)
-    print("CMD:", " ".join(cmd))
+    if VERBOSE:
+        print("CMD:", " ".join(cmd))
     proc = subprocess.Popen(cmd, stdout=logf, stderr=logf)
 
     uploaded_all = []
@@ -376,7 +384,9 @@ def main():
     chat_id = env("CHAT_ID")
     log_channel = env("LOG_CHANNEL_ID")
     mongo_uri = env("MONGO_URI")
-    watch_base = env("PUBLIC_WATCH_BASE_URL", "https://v1homelander-8naz.onrender.com").rstrip('/')
+    watch_base = env("PUBLIC_WATCH_BASE_URL").rstrip('/')
+    if not watch_base:
+        raise SystemExit("PUBLIC_WATCH_BASE_URL secret missing")
     workers = parse_csv(env("WORKER_BASE_URLS"))
     tokens = parse_tokens()
 
@@ -388,7 +398,7 @@ def main():
     Path("output").mkdir(exist_ok=True)
     direct = get_direct_link(video_url)
     chosen_worker = select_worker(workers, video_url, title, force_worker_index)
-    print("Chosen worker:", chosen_worker)
+    print("Chosen worker:", chosen_worker if VERBOSE else "(masked)")
     print("Bots available:", len(tokens))
 
     # v6.2: pehle source probe -> smart hls_time -> single pass (+1 fallback)
@@ -444,7 +454,7 @@ def main():
     if mongo_uri:
         client = MongoClient(mongo_uri)
         client["video_database"]["segments"].insert_one(doc)
-        print("Mongo inserted movie_id:", movie_id)
+        print("Mongo inserted movie_id:", movie_id if VERBOSE else mm(movie_id))
     else:
         print("MONGO_URI missing, metadata only saved.")
 
@@ -453,7 +463,7 @@ def main():
         "✅ <b>Worker BotAPI Upload Complete (V6.2 smart)</b>\n\n"
         f"🎬 <b>Title:</b> {title}\n"
         f"🆔 <b>Movie ID:</b> <code>{movie_id}</code>\n"
-        f"🔗 <b>Source:</b> {video_url}\n"
+        f"🔗 <b>Source:</b> {"(masked)" if not VERBOSE else video_url}\n"
         f"📦 <b>Parts:</b> {len(segments)+1}\n"
         f"⏱️ <b>Time:</b> {elapsed//60}m {elapsed%60}s\n"
         f"🎞️ <b>Mode:</b> video={video_mode}, audio={audio_mode}\n"
@@ -462,7 +472,7 @@ def main():
         f"▶️ <b>Watch:</b> {watch_url}"
     )
     send_log_message(tokens[0], log_channel, log_text)
-    print("DONE movie_id:", movie_id)
+    print("DONE movie_id:", movie_id if VERBOSE else mm(movie_id))
 
 if __name__ == "__main__":
     main()
