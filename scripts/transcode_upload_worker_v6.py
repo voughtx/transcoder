@@ -1,4 +1,4 @@
-import os, re, json, time, random, base64, subprocess, mimetypes, shutil, hashlib
+import os, re, json, time, random, base64, subprocess, mimetypes, shutil, hashlib, math
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
 from concurrent.futures import ThreadPoolExecutor
